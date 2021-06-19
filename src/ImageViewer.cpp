@@ -381,6 +381,10 @@ ImageViewer::ImageViewer(const shared_ptr<BackgroundImagesLoader>& imagesLoader,
             }, ENTYPO_ICON_SAVE, tfm::format("Save (%s+S)", HelpWindow::COMMAND)));
 
             mCurrentImageButtons.push_back(makeImageButton("", false, [this] {
+                saveCurrentViewDialog(mCurrentImage);
+            }, ENTYPO_ICON_EXPORT, tfm::format("Save Current View (%s+Shift+E)", HelpWindow::COMMAND)));
+
+            mCurrentImageButtons.push_back(makeImageButton("", false, [this] {
                 reloadImage(mCurrentImage);
             }, ENTYPO_ICON_CYCLE, tfm::format("Reload (%s+R or F5)", HelpWindow::COMMAND)));
 
@@ -1104,6 +1108,51 @@ void ImageViewer::reloadImage(shared_ptr<Image> image, bool shallSelect) {
     if (referenceId != -1) {
         selectReference(mImages[referenceId]);
     }
+}
+
+void ImageViewer::saveCurrentViewDialog(shared_ptr<Image> image, bool shallSelect) {
+    int currentId = imageId(mCurrentImage);
+    int id = imageId(image);
+    if (id == -1) {
+        return;
+    }
+
+    // If we already have the image selected, we must re-select it
+    // regardless of the `shallSelect` parameter.
+    shallSelect |= currentId == id;
+
+    
+    path imgPath = image->path();
+    
+    std::string base = image->shortName();
+    size_t slashPosition = base.find_last_of(".\\");
+    if (slashPosition != string::npos) {
+        base = base.substr(0, slashPosition - 1);
+    }
+
+    // yes
+    if ( imgPath.extension().compare("exr") == 0) {
+        path targetPath = path(imgPath.parent_path().str() + "/" + base + ".png");
+        
+        if (targetPath.exists()) {
+            tlog::warning() << "Target Path " << targetPath.str() << " exists.";
+            targetPath = ensureUtf8(file_dialog(
+                {
+                    {"exr",  "OpenEXR image"},
+                    {"hdr",  "HDR image"},
+                    {"bmp",  "Bitmap Image File"},
+                    {"jpg",  "JPEG image"},
+                    {"jpeg", "JPEG image"},
+                    {"png",  "Portable Network Graphics image"},
+                    {"tga",  "Truevision TGA image"},
+                }, true));
+        } 
+
+        if (!targetPath.empty())
+            mImageCanvas->saveImage(targetPath);
+    }
+    
+    
 }
 
 void ImageViewer::reloadAllImages() {

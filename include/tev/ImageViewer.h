@@ -53,6 +53,9 @@ public:
     void removeAllImages();
 
     void reloadImage(std::shared_ptr<Image> image, bool shallSelect = false);
+
+    void saveCurrentViewDialog(std::shared_ptr<Image> image, bool shallSelect = false);
+
     void reloadImage(const std::string& imageName, bool shallSelect = false) {
         reloadImage(imageByName(imageName), shallSelect);
     }
