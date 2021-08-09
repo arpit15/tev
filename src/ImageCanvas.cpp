@@ -7,8 +7,10 @@
 
 #include <tev/imageio/ImageSaver.h>
 
-#include <nanogui/theme.h>
+#include <nanogui/opengl.h>
 #include <nanogui/screen.h>
+#include <nanogui/theme.h>
+#include <nanogui/vector.h>
 
 #include <fstream>
 #include <numeric>
@@ -16,23 +18,23 @@
 
 using namespace Eigen;
 using namespace filesystem;
-using namespace nanogui;
 using namespace std;
 
 TEV_NAMESPACE_BEGIN
 
 ImageCanvas::ImageCanvas(nanogui::Widget* parent, float pixelRatio)
-: GLCanvas(parent), mPixelRatio(pixelRatio) {
-    setDrawBorder(false);
+: Canvas{parent, 1, false, false, false}, mPixelRatio{pixelRatio} {
+    mShader.reset(new UberShader{render_pass()});
+    set_draw_border(false);
 }
 
-bool ImageCanvas::scrollEvent(const Vector2i& p, const Vector2f& rel) {
-    if (GLCanvas::scrollEvent(p, rel)) {
+bool ImageCanvas::scroll_event(const nanogui::Vector2i& p, const nanogui::Vector2f& rel) {
+    if (Canvas::scroll_event(p, rel)) {
         return true;
     }
 
     float scaleAmount = rel.y();
-    auto* glfwWindow = screen()->glfwWindow();
+    auto* glfwWindow = screen()->glfw_window();
     // There is no explicit access to the currently pressed modifier keys here, so we
     // need to directly ask GLFW.
     if (glfwGetKey(glfwWindow, GLFW_KEY_LEFT_SHIFT) || glfwGetKey(glfwWindow, GLFW_KEY_RIGHT_SHIFT)) {
@@ -41,57 +43,59 @@ bool ImageCanvas::scrollEvent(const Vector2i& p, const Vector2f& rel) {
         scaleAmount /= std::log2(1.1f);
     }
 
-    scale(scaleAmount, p.cast<float>());
+    scale(scaleAmount, {p.x(), p.y()});
     return true;
 }
 
-void ImageCanvas::drawGL() {
-    auto* glfwWindow = screen()->glfwWindow();
+void ImageCanvas::draw_contents() {
+    auto* glfwWindow = screen()->glfw_window();
     Image* image = (mReference && glfwGetKey(glfwWindow, GLFW_KEY_LEFT_SHIFT)) ? mReference.get() : mImage.get();
 
     if (!image) {
-        mShader.draw(
-            2.0f * mSize.cast<float>().cwiseInverse() / mPixelRatio,
+        mShader->draw(
+            2.0f * Vector2f{m_size.x(), m_size.y()}.cwiseInverse() / mPixelRatio,
             Vector2f::Constant(20)
         );
         return;
     }
 
     if (!mReference || glfwGetKey(glfwWindow, GLFW_KEY_LEFT_CONTROL) || image == mReference.get()) {
-        mShader.draw(
-            2.0f * mSize.cast<float>().cwiseInverse() / mPixelRatio,
+        mShader->draw(
+            2.0f * Vector2f{m_size.x(), m_size.y()}.cwiseInverse() / mPixelRatio,
             Vector2f::Constant(20),
             image->texture(mRequestedChannelGroup),
             // The uber shader operates in [-1, 1] coordinates and requires the _inserve_
             // image transform to obtain texture coordinates in [0, 1]-space.
-            transform(image).inverse().matrix(),
+            toNanogui(transform(image).inverse().matrix()),
             mExposure,
             mOffset,
             mGamma,
+            mClipToLdr,
             mTonemap
         );
         return;
     }
 
-    mShader.draw(
-        2.0f * mSize.cast<float>().cwiseInverse() / mPixelRatio,
+    mShader->draw(
+        2.0f * Vector2f{m_size.x(), m_size.y()}.cwiseInverse() / mPixelRatio,
         Vector2f::Constant(20),
         mImage->texture(mRequestedChannelGroup),
         // The uber shader operates in [-1, 1] coordinates and requires the _inserve_
         // image transform to obtain texture coordinates in [0, 1]-space.
-        transform(mImage.get()).inverse().matrix(),
+        toNanogui(transform(mImage.get()).inverse().matrix()),
         mReference->texture(mRequestedChannelGroup),
-        transform(mReference.get()).inverse().matrix(),
+        toNanogui(transform(mReference.get()).inverse().matrix()),
         mExposure,
         mOffset,
         mGamma,
+        mClipToLdr,
         mTonemap,
         mMetric
     );
 }
 
 void ImageCanvas::draw(NVGcontext *ctx) {
-    GLCanvas::draw(ctx);
+    nanogui::Canvas::draw(ctx);
 
     if (mImage) {
         auto texToNano = textureToNanogui(mImage.get());
@@ -100,7 +104,7 @@ void ImageCanvas::draw(NVGcontext *ctx) {
         Vector2f pixelSize = texToNano * Vector2f::Ones() - texToNano * Vector2f::Zero();
 
         Vector2f topLeft = (nanoToTex * Vector2f::Zero());
-        Vector2f bottomRight = (nanoToTex * mSize.cast<float>());
+        Vector2f bottomRight = (nanoToTex * Vector2f{m_size.x(), m_size.y()});
 
         Vector2i startIndices = Vector2i{
             static_cast<int>(floor(topLeft.x())),
@@ -117,7 +121,7 @@ void ImageCanvas::draw(NVGcontext *ctx) {
             // Remove duplicates
             channels.erase(unique(begin(channels), end(channels)), end(channels));
 
-            vector<Color> colors;
+            vector<nanogui::Color> colors;
             for (const auto& channel : channels) {
                 colors.emplace_back(Channel::color(channel));
             }
@@ -132,7 +136,7 @@ void ImageCanvas::draw(NVGcontext *ctx) {
             nvgFontFace(ctx, "sans");
             nvgTextAlign(ctx, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 
-            auto* glfwWindow = screen()->glfwWindow();
+            auto* glfwWindow = screen()->glfw_window();
             bool altHeld = glfwGetKey(glfwWindow, GLFW_KEY_LEFT_ALT) || glfwGetKey(glfwWindow, GLFW_KEY_RIGHT_ALT);
 
             Vector2i cur;
@@ -147,27 +151,27 @@ void ImageCanvas::draw(NVGcontext *ctx) {
                     for (size_t i = 0; i < colors.size(); ++i) {
                         string str;
                         Vector2f pos;
-                        
+
                         if (altHeld) {
                             float tonemappedValue = Channel::tail(channels[i]) == "A" ? values[i] : toSRGB(values[i]);
                             unsigned char discretizedValue = (char)(tonemappedValue * 255 + 0.5f);
                             str = tfm::format("%02X", discretizedValue);
 
                             pos = Vector2f{
-                                mPos.x() + nano.x() + (i - 0.5f * (colors.size() - 1)) * fontSize * 0.88f,
-                                mPos.y() + nano.y(),
+                                m_pos.x() + nano.x() + (i - 0.5f * (colors.size() - 1)) * fontSize * 0.88f,
+                                m_pos.y() + nano.y(),
                             };
                         } else {
                             str = tfm::format("%.4f", values[i]);
 
                             pos = Vector2f{
-                                mPos.x() + nano.x(),
-                                mPos.y() + nano.y() + (i - 0.5f * (colors.size() - 1)) * fontSize,
+                                m_pos.x() + nano.x(),
+                                m_pos.y() + nano.y() + (i - 0.5f * (colors.size() - 1)) * fontSize,
                             };
                         }
 
-                        Color col = colors[i];
-                        nvgFillColor(ctx, Color(col.r(), col.g(), col.b(), fontAlpha));
+                        nanogui::Color col = colors[i];
+                        nvgFillColor(ctx, nanogui::Color(col.r(), col.g(), col.b(), fontAlpha));
                         drawTextWithShadow(ctx, pos.x(), pos.y(), str, fontAlpha);
                     }
                 }
@@ -176,18 +180,18 @@ void ImageCanvas::draw(NVGcontext *ctx) {
     }
 
     // If we're not in fullscreen mode draw an inner drop shadow. (adapted from nanogui::Window)
-    if (mPos.x() != 0) {
-        int ds = mTheme->mWindowDropShadowSize, cr = mTheme->mWindowCornerRadius;
+    if (m_pos.x() != 0) {
+        int ds = m_theme->m_window_drop_shadow_size, cr = m_theme->m_window_corner_radius;
         NVGpaint shadowPaint = nvgBoxGradient(
-            ctx, mPos.x(), mPos.y(), mSize.x(), mSize.y(), cr * 2, ds * 2,
-            mTheme->mTransparent, mTheme->mDropShadow
+            ctx, m_pos.x(), m_pos.y(), m_size.x(), m_size.y(), cr * 2, ds * 2,
+            m_theme->m_transparent, m_theme->m_drop_shadow
         );
 
         nvgSave(ctx);
         nvgResetScissor(ctx);
         nvgBeginPath(ctx);
-        nvgRect(ctx, mPos.x(), mPos.y(), mSize.x(), mSize.y());
-        nvgRoundedRect(ctx, mPos.x() + ds, mPos.y() + ds, mSize.x() - 2 * ds, mSize.y() - 2 * ds, cr);
+        nvgRect(ctx, m_pos.x(), m_pos.y(), m_size.x(), m_size.y());
+        nvgRoundedRect(ctx, m_pos.x() + ds, m_pos.y() + ds, m_size.x() - 2 * ds, m_size.y() - 2 * ds, cr);
         nvgPathWinding(ctx, NVG_HOLE);
         nvgFillPaint(ctx, shadowPaint);
         nvgFill(ctx);
@@ -203,7 +207,7 @@ void ImageCanvas::scale(float amount, const Vector2f& origin) {
     float scaleFactor = pow(1.1f, amount);
 
     // Use the current cursor position as the origin to scale around.
-    Vector2f offset = -(origin - position().cast<float>()) + 0.5f * mSize.cast<float>();
+    Vector2f offset = -(origin - Eigen::Vector2f(position().x(), position().y())) + 0.5f * Eigen::Vector2f(m_size.x(), m_size.y());
     auto scaleTransform =
         Translation2f(-offset) *
         Scaling(scaleFactor) *
@@ -302,7 +306,7 @@ float ImageCanvas::applyMetric(float image, float reference, EMetric metric) {
 
 void ImageCanvas::fitImageToScreen(const Image& image) {
     Vector2f nanoguiImageSize = image.size().cast<float>() / mPixelRatio;
-    mTransform = Scaling(mSize.cast<float>().cwiseQuotient(nanoguiImageSize).minCoeff());
+    mTransform = Scaling(Vector2f{m_size.x(), m_size.y()}.cwiseQuotient(nanoguiImageSize).minCoeff());
 }
 
 void ImageCanvas::resetTransform() {
@@ -328,8 +332,7 @@ std::vector<float> ImageCanvas::getHdrImageData(bool divideAlpha) const {
     // Flatten image into vector
     result.resize(4 * numPixels, 0);
 
-    ThreadPool pool;
-    pool.parallelFor(0, nChannelsToSave, [&channels, &result](int i) {
+    gThreadPool->parallelFor(0, nChannelsToSave, [&channels, &result](int i) {
         const auto& channelData = channels[i].data();
         for (DenseIndex j = 0; j < channelData.size(); ++j) {
             result[j * 4 + i] = channelData(j);
@@ -345,7 +348,7 @@ std::vector<float> ImageCanvas::getHdrImageData(bool divideAlpha) const {
 
     // Divide alpha out if needed (for storing in non-premultiplied formats)
     if (divideAlpha) {
-        pool.parallelFor(0, min(nChannelsToSave, 3), [&result,numPixels](int i) {
+        gThreadPool->parallelFor(0, min(nChannelsToSave, 3), [&result,numPixels](int i) {
             for (DenseIndex j = 0; j < numPixels; ++j) {
                 float alpha = result[j * 4 + 3];
                 if (alpha == 0) {
@@ -373,8 +376,7 @@ std::vector<char> ImageCanvas::getLdrImageData(bool divideAlpha) const {
     // Store as LDR image.
     result.resize(floatData.size());
 
-    ThreadPool pool;
-    pool.parallelFor<DenseIndex>(0, numPixels, [&](DenseIndex i) {
+    gThreadPool->parallelFor<DenseIndex>(0, numPixels, [&](DenseIndex i) {
         size_t start = 4 * i;
         Vector3f value = applyTonemap({
             applyExposureAndOffset(floatData[start]),
@@ -479,8 +481,7 @@ vector<Channel> ImageCanvas::channelsFromImages(
     bool onlyAlpha = all_of(begin(result), end(result), [](const Channel& c) { return c.name() == "A"; });
 
     if (!reference) {
-        ThreadPool pool;
-        pool.parallelFor(0, (int)channelNames.size(), [&](int i) {
+        gThreadPool->parallelFor(0, (int)channelNames.size(), [&](int i) {
             const auto* chan = image->channel(channelNames[i]);
             for (DenseIndex j = 0; j < chan->count(); ++j) {
                 result[i].at(j) = chan->eval(j);
@@ -491,8 +492,7 @@ vector<Channel> ImageCanvas::channelsFromImages(
         Vector2i offset = (reference->size() - size) / 2;
         auto referenceChannels = reference->channelsInGroup(requestedChannelGroup);
 
-        ThreadPool pool;
-        pool.parallelFor<size_t>(0, channelNames.size(), [&](size_t i) {
+        gThreadPool->parallelFor<size_t>(0, channelNames.size(), [&](size_t i) {
             const auto* chan = image->channel(channelNames[i]);
             bool isAlpha = !onlyAlpha && result[i].name() == "A";
 
@@ -616,16 +616,16 @@ shared_ptr<CanvasStatistics> ImageCanvas::computeCanvasStatistics(
     auto numElements = image->count();
     Eigen::MatrixXi indices(numElements, nChannels);
 
-    ThreadPool pool;
+    vector<future<void>> futures;
     for (int i = 0; i < nChannels; ++i) {
         const auto& channel = flattened[i];
-        pool.parallelForNoWait<DenseIndex>(0, numElements, [&, i](DenseIndex j) {
+        gThreadPool->parallelForAsync<DenseIndex>(0, numElements, [&, i](DenseIndex j) {
             indices(j, i) = valToBin(channel.eval(j));
-        });
+        }, futures);
     }
-    pool.waitUntilFinished();
+    waitAll(futures);
 
-    pool.parallelFor(0, nChannels, [&](int i) {
+    gThreadPool->parallelFor(0, nChannels, [&](int i) {
         for (DenseIndex j = 0; j < numElements; ++j) {
             result->histogram(indices(j, i), i) += alphaChannel ? alphaChannel->eval(j) : 1;
         }
@@ -665,7 +665,7 @@ Transform<float, 2, 2> ImageCanvas::transform(const Image* image) {
     // Center image, scale to pixel space, translate to desired position,
     // then rescale to the [-1, 1] square for drawing.
     return
-        Scaling(2.0f / mSize.x(), -2.0f / mSize.y()) *
+        Scaling(2.0f / m_size.x(), -2.0f / m_size.y()) *
         mTransform *
         Scaling(1.0f / mPixelRatio) *
         Translation2f(pixelOffset(image->size())) *
@@ -680,7 +680,7 @@ Transform<float, 2, 2> ImageCanvas::textureToNanogui(const Image* image) {
 
     // Move origin to centre of image, scale pixels, apply our transform, move origin back to top-left.
     return
-        Translation2f(0.5f * mSize.cast<float>()) *
+        Translation2f(0.5f * Vector2f{m_size.x(), m_size.y()}) *
         mTransform *
         Scaling(1.0f / mPixelRatio) *
         Translation2f(-0.5f * image->size().cast<float>() + pixelOffset(image->size()));

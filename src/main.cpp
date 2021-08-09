@@ -11,6 +11,11 @@
 
 #include <utf8.h>
 
+#ifdef __APPLE__
+#define GLFW_EXPOSE_NATIVE_COCOA
+#include <GLFW/glfw3native.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -22,7 +27,26 @@ using namespace std;
 
 TEV_NAMESPACE_BEGIN
 
-void handleIpcPacket(const IpcPacket& packet, const std::shared_ptr<BackgroundImagesLoader>& imagesLoader, const std::unique_ptr<ImageViewer>& imageViewer) {
+ThreadPool* gThreadPool = new ThreadPool{};
+
+// Image viewer is a static variable to allow other
+// parts of the program to easily schedule operations
+// onto the main nanogui thread loop.
+// In a truly modular program, this would never be required,
+// but OpenGL's state-machine nature throws a wrench into
+// modularity.
+// Currently, the only use case is the destruction of
+// OpenGL textures, which _must_ happen on the thread
+// on which the GL context is "current".
+static ImageViewer* sImageViewer = nullptr;
+
+void scheduleToMainThread(const std::function<void()>& fun) {
+    if (sImageViewer) {
+        sImageViewer->scheduleToUiThread(fun);
+    }
+}
+
+void handleIpcPacket(const IpcPacket& packet, const std::shared_ptr<BackgroundImagesLoader>& imagesLoader) {
     switch (packet.type()) {
         case IpcPacket::OpenImage:
         case IpcPacket::OpenImageV2: {
@@ -32,49 +56,49 @@ void handleIpcPacket(const IpcPacket& packet, const std::shared_ptr<BackgroundIm
         }
 
         case IpcPacket::ReloadImage: {
-            while (!imageViewer) { }
+            while (!sImageViewer) { }
             auto info = packet.interpretAsReloadImage();
-            imageViewer->scheduleToUiThread([&,info] {
+            sImageViewer->scheduleToUiThread([&,info] {
                 string imageString = ensureUtf8(info.imageName);
-                imageViewer->reloadImage(imageString, info.grabFocus);
+                sImageViewer->reloadImage(imageString, info.grabFocus);
             });
 
-            glfwPostEmptyEvent();
+            sImageViewer->redraw();
             break;
         }
 
         case IpcPacket::CloseImage: {
-            while (!imageViewer) { }
+            while (!sImageViewer) { }
             auto info = packet.interpretAsCloseImage();
-            imageViewer->scheduleToUiThread([&,info] {
+            sImageViewer->scheduleToUiThread([&,info] {
                 string imageString = ensureUtf8(info.imageName);
-                imageViewer->removeImage(imageString);
+                sImageViewer->removeImage(imageString);
             });
 
-            glfwPostEmptyEvent();
+            sImageViewer->redraw();
             break;
         }
 
         case IpcPacket::UpdateImage:
         case IpcPacket::UpdateImageV2:
         case IpcPacket::UpdateImageV3: {
-            while (!imageViewer) { }
+            while (!sImageViewer) { }
             auto info = packet.interpretAsUpdateImage();
-            imageViewer->scheduleToUiThread([&,info] {
+            sImageViewer->scheduleToUiThread([&,info] {
                 string imageString = ensureUtf8(info.imageName);
                 for (int i = 0; i < info.nChannels; ++i) {
-                    imageViewer->updateImage(imageString, info.grabFocus, info.channelNames[i], info.x, info.y, info.width, info.height, info.imageData[i]);
+                    sImageViewer->updateImage(imageString, info.grabFocus, info.channelNames[i], info.x, info.y, info.width, info.height, info.imageData[i]);
                 }
             });
 
-            glfwPostEmptyEvent();
+            sImageViewer->redraw();
             break;
         }
 
         case IpcPacket::CreateImage: {
-            while (!imageViewer) { }
+            while (!sImageViewer) { }
             auto info = packet.interpretAsCreateImage();
-            imageViewer->scheduleToUiThread([&,info] {
+            sImageViewer->scheduleToUiThread([&,info] {
                 string imageString = ensureUtf8(info.imageName);
                 stringstream imageStream;
                 imageStream
@@ -92,11 +116,11 @@ void handleIpcPacket(const IpcPacket& packet, const std::shared_ptr<BackgroundIm
 
                 auto image = tryLoadImage(imageString, imageStream, "");
                 if (image) {
-                    imageViewer->addImage(image, info.grabFocus);
+                    sImageViewer->addImage(image, info.grabFocus);
                 }
             });
 
-            glfwPostEmptyEvent();
+            sImageViewer->redraw();
             break;
         }
 
@@ -152,6 +176,13 @@ int mainFunc(const vector<string>& arguments) {
         "tev can have a distinct primary instance for each unique hostname in use. "
         "Default is 127.0.0.1:14158",
         {"host", "hostname"},
+    };
+
+    Flag ldrFlag{
+        parser,
+        "LDR",
+        "Force low dynamic range (8-bit) display colors.",
+        {"ldr"},
     };
 
     ValueFlag<bool> maximizeFlag{
@@ -266,7 +297,7 @@ int mainFunc(const vector<string>& arguments) {
                 IpcPacket packet;
                 packet.setOpenImage(path{imageFile}.make_absolute().str(), channelSelector, true);
                 ipc->sendToPrimaryInstance(packet);
-            } catch (runtime_error e) {
+            } catch (const runtime_error& e) {
                 tlog::error() << tfm::format("Invalid file '%s': %s", imageFile, e.what());
             }
         }
@@ -312,8 +343,6 @@ int mainFunc(const vector<string>& arguments) {
     // terminated as the main thread terminates.
     stdinThread.detach();
 
-    unique_ptr<ImageViewer> imageViewer;
-
     // Spawn another background thread, this one dealing with images passed to us
     // via inter-process communication (IPC). This happens when
     // a user starts another instance of tev while one is already running. Note, that this
@@ -325,7 +354,7 @@ int mainFunc(const vector<string>& arguments) {
             while (!shallShutdown) {
                 ipc->receiveFromSecondaryInstance([&](const IpcPacket& packet) {
                     try {
-                        handleIpcPacket(packet, imagesLoader, imageViewer);
+                        handleIpcPacket(packet, imagesLoader);
                     } catch (const runtime_error& e) {
                         tlog::warning() << "Malformed IPC packet: " << e.what();
                     }
@@ -352,23 +381,47 @@ int mainFunc(const vector<string>& arguments) {
     // Init nanogui application
     nanogui::init();
 
-    imageViewer.reset(new ImageViewer{imagesLoader, !imageFiles});
-    imageViewer->drawAll();
-    imageViewer->setVisible(true);
+#ifdef __APPLE__
+    if (!imageFiles) {
+        // If we didn't get any command line arguments for files to open,
+        // then, on macOS, they might have been supplied through the NS api.
+        const char* const* openedFiles = glfwGetOpenedFilenames();
+        if (openedFiles) {
+            for (auto p = openedFiles; *p; ++p) {
+                imagesLoader->enqueue(*p, "", false);
+            }
+        }
+    }
+#endif
+
+    auto [capability10bit, capabilityEdr] = nanogui::test_10bit_edr_support();
+    if (get(ldrFlag)) {
+        capability10bit = false;
+        capabilityEdr = false;
+    }
+
+    tlog::info() << "Launching with " << (capability10bit ? 10 : 8) << " bits of color and " << (capabilityEdr ? "HDR" : "LDR") << " display support.";
 
     // Do what the maximize flag tells us---if it exists---and
     // maximize if we have images otherwise.
-    if (maximizeFlag ? get(maximizeFlag) : imageFiles) {
-        imageViewer->maximize();
-    }
+    bool maximize = maximizeFlag ? get(maximizeFlag) : imageFiles;
+
+    // sImageViewer is a raw pointer to make sure it will never
+    // get deleted. nanogui crashes upon cleanup, so we better
+    // not try.
+    sImageViewer = new ImageViewer{imagesLoader, maximize, capability10bit || capabilityEdr, capabilityEdr};
+
+    sImageViewer->draw_all();
+    sImageViewer->set_visible(true);
+    sImageViewer->redraw();
 
     // Apply parameter flags
-    if (exposureFlag) { imageViewer->setExposure(get(exposureFlag)); }
-    if (filterFlag)   { imageViewer->setFilter(get(filterFlag)); }
-    if (gammaFlag)    { imageViewer->setGamma(get(gammaFlag)); }
-    if (metricFlag)   { imageViewer->setMetric(toMetric(get(metricFlag))); }
-    if (offsetFlag)   { imageViewer->setOffset(get(offsetFlag)); }
-    if (tonemapFlag)  { imageViewer->setTonemap(toTonemap(get(tonemapFlag))); }
+    if (exposureFlag) { sImageViewer->setExposure(get(exposureFlag)); }
+    if (filterFlag)   { sImageViewer->setFilter(get(filterFlag)); }
+    if (gammaFlag)    { sImageViewer->setGamma(get(gammaFlag)); }
+    if (metricFlag)   { sImageViewer->setMetric(toMetric(get(metricFlag))); }
+    if (offsetFlag)   { sImageViewer->setOffset(get(offsetFlag)); }
+    if (tonemapFlag)  { sImageViewer->setTonemap(toTonemap(get(tonemapFlag))); }
 
     // Refresh only every 250ms if there are no user interactions.
     // This makes an idling tev surprisingly energy-efficient. :)
@@ -388,8 +441,6 @@ int mainFunc(const vector<string>& arguments) {
     if (stdinThread.joinable()) {
         stdinThread.join();
     }
-
-    imageViewer.reset();
 
     return 0;
 }

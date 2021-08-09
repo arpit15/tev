@@ -58,6 +58,9 @@ struct NVGcontext;
 
 TEV_NAMESPACE_BEGIN
 
+class ThreadPool;
+extern ThreadPool* gThreadPool;
+
 inline uint32_t swapBytes(uint32_t value) {
 #ifdef _WIN32
     return _byteswap_ulong(value);
@@ -181,6 +184,9 @@ std::string errorString(int errorId);
 filesystem::path homeDirectory();
 
 void toggleConsole();
+
+// Implemented in main.cpp
+void scheduleToMainThread(const std::function<void()>& fun);
 
 enum ETonemap : int {
     SRGB = 0,
