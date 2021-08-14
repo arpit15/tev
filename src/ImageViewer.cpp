@@ -401,7 +401,7 @@ ImageViewer::ImageViewer(const shared_ptr<BackgroundImagesLoader>& imagesLoader,
 
             mCurrentImageButtons.push_back(makeImageButton("", false, [this] {
                 saveCurrentViewDialog(mCurrentImage);
-            }, ENTYPO_ICON_EXPORT, tfm::format("Save Current View (%s+Shift+E)", HelpWindow::COMMAND)));
+            }, FA_SKIING_NORDIC, tfm::format("Save Current View (%s+Shift+E)", HelpWindow::COMMAND)));
 
             mCurrentImageButtons.push_back(makeImageButton("", false, [this] {
                 reloadImage(mCurrentImage);
